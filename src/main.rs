@@ -1,5 +1,6 @@
 mod ei;
 
+use std::io::Result as IOResult;
 
 fn main() {
     let port = 20170;
@@ -16,7 +17,7 @@ fn main() {
     }
 }
 
-fn handle_connection((fd, _): (i32, ei::ErlConnect)) -> Result<(), i32> {
+fn handle_connection((fd, _): (i32, ei::ErlConnect)) -> IOResult<()> {
     let mut run = 1;
     while run == 1 {
         let mut xbuf = ei::XBuf::new();
@@ -43,7 +44,7 @@ fn handle_connection((fd, _): (i32, ei::ErlConnect)) -> Result<(), i32> {
                 let binary = xbuf.decode_binary().unwrap();
                 println!("got binary: {:?}", binary);
             }
-            _ => println!("got unimplemented type!")
+            _else => println!("got unimplemented type! {:?}", _else)
 
         };
     }
@@ -52,6 +53,6 @@ fn handle_connection((fd, _): (i32, ei::ErlConnect)) -> Result<(), i32> {
 }
 
 
-fn init_cnode(_ignore: ()) -> Result<ei::ErlangNode, i32> {
+fn init_cnode(_ignore: ()) -> IOResult<ei::ErlangNode> {
     ei::NodeBuilder::new("secret", "cnode").connect_init()
 }

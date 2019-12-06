@@ -60,7 +60,7 @@ impl NodeBuilder {
         self
     }
 
-    pub fn connect_init(self: NodeBuilder) -> Result<ErlangNode, i32> {
+    pub fn connect_init(self: NodeBuilder) -> IOResult<ErlangNode> {
         let mut node = MaybeUninit::<CNode>::uninit();
         let nodename = self.nodename.unwrap();
         let cookie = self.cookie.unwrap();
@@ -87,7 +87,7 @@ impl NodeBuilder {
             }
         };
         if code == ei_sys::ERL_ERROR {
-            Err(error_code())
+            Err(Error::from_raw_os_error(error_code()))
         } else {
             let cnode = unsafe {node.assume_init()};
             Ok(ErlangNode{
@@ -99,12 +99,12 @@ impl NodeBuilder {
     }
 }
 
-pub fn init() -> Result<(), i32> {
+pub fn init() -> IOResult<()> {
     let code = unsafe {ei_sys::ei_init()};
     if code == 0 {
         Ok(())
     } else {
-        Err(code)
+        Err(Error::from_raw_os_error(error_code()))
     }
 }
 
@@ -128,25 +128,25 @@ impl ErlangNode {
         }
     }
 
-    pub fn accept(self: &mut ErlangNode, listensock: FileDescr) -> Result<(i32, ErlConnect), i32> {
+    pub fn accept(self: &mut ErlangNode, listensock: FileDescr) -> IOResult<(i32, ErlConnect)> {
         let mut mem = MaybeUninit::<ErlConnect>::uninit();
         let ret = unsafe {
             ei_sys::ei_accept(&mut self.cnode, listensock, mem.as_mut_ptr())
         };
         if ret == ei_sys::ERL_ERROR {
-            Err(error_code())
+            Err(Error::from_raw_os_error(error_code()))
         } else {
             let conn: ErlConnect = unsafe {mem.assume_init()};
             Ok((ret, conn))
         }
     }
 
-    pub fn publish(self: &mut ErlangNode, port: i32) -> Result<FileDescr, i32> {
+    pub fn publish(self: &mut ErlangNode, port: i32) -> IOResult<FileDescr> {
         let ret = unsafe {
             ei_sys::ei_publish(&mut self.cnode, port)
         };
         if ret == ei_sys::ERL_ERROR {
-            Err(error_code())
+            Err(Error::from_raw_os_error(error_code()))
         } else {
             self.epmd_fd = Some(ret);
             Ok(ret)
@@ -156,6 +156,7 @@ impl ErlangNode {
 }
 
 type Arity = i32;
+#[derive(Debug)]
 pub enum ErlangType {
     Integer,
     Float,
@@ -171,7 +172,7 @@ pub enum ErlangType {
     BigInt(Arity),
     Function,
     Map(Arity),
-    NotImplemented,
+    NotImplemented(u32),
 }
 
 #[derive(Debug)]
@@ -267,15 +268,15 @@ impl XBuf {
         unsafe {ei_sys::ei_x_free(&mut self.xbuf)};
     }
 
-    pub fn receive_msg(&mut self, fd: i32) -> Result<ErlangMsg, ErlangRecvError> {
+    pub fn receive_msg(&mut self, fd: i32) -> IOResult<ErlangMsg> {
         let mut msg_mem = MaybeUninit::<ei_sys::erlang_msg>::uninit();
         let erl_code = unsafe {
             ei_sys::ei_xreceive_msg(fd, msg_mem.as_mut_ptr(), &mut self.xbuf)
         };
         if erl_code == ei_sys::ERL_ERROR {
-            Err(ErlangRecvError::SomeError)
+            Err(Error::from_raw_os_error(error_code()))
         } else if erl_code == ei_sys::ERL_TICK {
-            Err(ErlangRecvError::TryAgain)
+            Err(Error::from_raw_os_error(error_code()))
         } else {
             Ok(ErlangMsg(unsafe {msg_mem.assume_init()}))
         }
@@ -403,9 +404,9 @@ impl XBuf {
         self
     }
 
-    pub fn encode_pid(&mut self, pid: &ei_sys::erlang_pid) -> &mut XBuf {
+    pub fn encode_pid(&mut self, pid: &ErlangPid) -> &mut XBuf {
         unsafe {
-            ei_sys::ei_x_encode_pid(&mut self.xbuf, pid)
+            ei_sys::ei_x_encode_pid(&mut self.xbuf, &pid.0)
         };
         self
     }
@@ -417,9 +418,9 @@ impl XBuf {
         self
     }
 
-    pub fn encode_ref(&mut self, eref: &ei_sys::erlang_ref) -> &mut XBuf {
+    pub fn encode_ref(&mut self, eref: &ErlangRef) -> &mut XBuf {
         unsafe {
-            ei_sys::ei_x_encode_ref(&mut self.xbuf, eref)
+            ei_sys::ei_x_encode_ref(&mut self.xbuf, &eref.0)
         };
         self
     }
@@ -500,7 +501,7 @@ impl XBuf {
             ei_sys::ERL_SMALL_BIG_EXT | ei_sys::ERL_LARGE_BIG_EXT => ErlangType::BigInt(size),
             ei_sys::ERL_FUN_EXT | ei_sys::ERL_NEW_FUN_EXT => ErlangType::Function,
             ei_sys::ERL_MAP_EXT => ErlangType::Map(size),
-            ei_sys::ERL_EXPORT_EXT | ei_sys::ERL_NIL_EXT | _ => ErlangType::NotImplemented,
+            otherwise => ErlangType::NotImplemented(otherwise as u32),
         };
         if get_type_ret == ei_sys::ERL_ERROR {
             Err(ErlangTypeError::CanNotGetType)
@@ -562,6 +563,221 @@ impl XBuf {
                 Err(ErlangTypeError::TypeDiffers)
             }
         })
+    }
+
+    pub fn decode_binary_string(&mut self) -> Result<String, ErlangTypeError> {
+        self.decode_binary()
+            .and_then(|vec| {
+                String::from_utf8(vec)
+                    .map_err(|_| ErlangTypeError::DecodeFails)
+            })
+    }
+
+    pub fn decode_string(&mut self) -> Result<String, ErlangTypeError> {
+        self.get_type().and_then(|ty:ErlangType| {
+            if let ErlangType::String(arity) = ty {
+                let bin_size = arity as usize + 1;
+                let mut bin = Vec::<u8>::with_capacity(bin_size);
+                let erl_code = unsafe {
+                    bin.set_len(bin_size);
+                    ei_sys::ei_decode_string(self.xbuf.buff, &mut self.xbuf.index, bin.as_mut_ptr() as *mut i8)
+                };
+                if erl_code == ei_sys::ERL_ERROR {
+                    Err(ErlangTypeError::DecodeFails)
+                } else {
+                    String::from_utf8(bin).map_err(|_| ErlangTypeError::DecodeFails)
+                }
+            } else {
+                Err(ErlangTypeError::TypeDiffers)
+            }
+        })
+    }
+
+    pub fn decode_boolean(&mut self) -> Result<bool, ErlangTypeError> {
+        self.get_type().and_then(|et:ErlangType| {
+            if let ErlangType::Atom(_) = et {
+                let mut bval = 0;
+                let erl_code = unsafe {
+                    ei_sys::ei_decode_boolean(self.xbuf.buff, &mut self.xbuf.index, &mut bval)
+                };
+                if erl_code == ei_sys::ERL_ERROR {
+                    Err(ErlangTypeError::DecodeFails)
+                } else {
+                    Ok(bval != 0)
+                }
+            } else {
+                Err(ErlangTypeError::TypeDiffers)
+            }
+        })
+    }
+
+    pub fn decode_char(&mut self) -> Result<u8, ErlangTypeError> {
+        self.get_type().and_then(|et:ErlangType| {
+            if let ErlangType::Integer = et {
+                let mut val = 0;
+                let erl_code = unsafe {
+                    ei_sys::ei_decode_char(self.xbuf.buff, &mut self.xbuf.index, &mut val)
+                };
+                if erl_code == ei_sys::ERL_ERROR {
+                    Err(ErlangTypeError::DecodeFails)
+                } else {
+                    Ok(val as u8)
+                }
+            } else {
+                Err(ErlangTypeError::TypeDiffers)
+            }
+        })
+    }
+
+    pub fn decode_double(&mut self) -> Result<f64, ErlangTypeError> {
+        self.get_type().and_then(|et:ErlangType| {
+            if let ErlangType::Float = et {
+                let mut val = Default::default();
+                let erl_code = unsafe {
+                    ei_sys::ei_decode_double(self.xbuf.buff, &mut self.xbuf.index, &mut val)
+                };
+                if erl_code == ei_sys::ERL_ERROR {
+                    Err(ErlangTypeError::DecodeFails)
+                } else {
+                    Ok(val)
+                }
+            } else {
+                Err(ErlangTypeError::TypeDiffers)
+            }
+        })
+    }
+
+    pub fn decode_list_header(&mut self) -> Result<i32, ErlangTypeError> {
+        self.get_type().and_then(|et:ErlangType| {
+            if let ErlangType::List(_) = et {
+                let mut val = 0;
+                let erl_code = unsafe {
+                    ei_sys::ei_decode_list_header(self.xbuf.buff, &mut self.xbuf.index, &mut val)
+                };
+                if erl_code == ei_sys::ERL_ERROR {
+                    Err(ErlangTypeError::DecodeFails)
+                } else {
+                    Ok(val)
+                }
+            } else {
+                Err(ErlangTypeError::TypeDiffers)
+            }
+        })
+    }
+
+    pub fn decode_map_header(&mut self) -> Result<i32, ErlangTypeError> {
+        self.get_type().and_then(|et:ErlangType| {
+            if let ErlangType::Map(_) = et {
+                let mut val = 0;
+                let erl_code = unsafe {
+                    ei_sys::ei_decode_map_header(self.xbuf.buff, &mut self.xbuf.index, &mut val)
+                };
+                if erl_code == ei_sys::ERL_ERROR {
+                    Err(ErlangTypeError::DecodeFails)
+                } else {
+                    Ok(val)
+                }
+            } else {
+                Err(ErlangTypeError::TypeDiffers)
+            }
+        })
+    }
+
+    pub fn decode_tuple_header(&mut self) -> Result<i32, ErlangTypeError> {
+        self.get_type().and_then(|et:ErlangType| {
+            if let ErlangType::Tuple(_) = et {
+                let mut val = 0;
+                let erl_code = unsafe {
+                    ei_sys::ei_decode_tuple_header(self.xbuf.buff, &mut self.xbuf.index, &mut val)
+                };
+                if erl_code == ei_sys::ERL_ERROR {
+                    Err(ErlangTypeError::DecodeFails)
+                } else {
+                    Ok(val)
+                }
+            } else {
+                Err(ErlangTypeError::TypeDiffers)
+            }
+        })
+    }
+
+    pub fn decode_long(&mut self) -> Result<i64, ErlangTypeError> {
+        self.get_type().and_then(|et:ErlangType| {
+            if let ErlangType::Integer = et {
+                let mut val = 0;
+                let erl_code = unsafe {
+                    ei_sys::ei_decode_long(self.xbuf.buff, &mut self.xbuf.index, &mut val)
+                };
+                if erl_code == ei_sys::ERL_ERROR {
+                    Err(ErlangTypeError::DecodeFails)
+                } else {
+                    Ok(val)
+                }
+            } else {
+                Err(ErlangTypeError::TypeDiffers)
+            }
+        })
+    }
+
+    pub fn decode_ulong(&mut self) -> Result<u64, ErlangTypeError> {
+        self.get_type().and_then(|et:ErlangType| {
+            if let ErlangType::Integer = et {
+                let mut val = 0;
+                let erl_code = unsafe {
+                    ei_sys::ei_decode_ulong(self.xbuf.buff, &mut self.xbuf.index, &mut val)
+                };
+                if erl_code == ei_sys::ERL_ERROR {
+                    Err(ErlangTypeError::DecodeFails)
+                } else {
+                    Ok(val)
+                }
+            } else {
+                Err(ErlangTypeError::TypeDiffers)
+            }
+        })
+    }
+
+    pub fn decode_pid(&mut self) -> Result<ErlangPid, ErlangTypeError> {
+        self.get_type().and_then(|et:ErlangType| {
+            if let ErlangType::Pid = et {
+                let mut val = MaybeUninit::<ei_sys::erlang_pid>::uninit();
+                let erl_code = unsafe {
+                    ei_sys::ei_decode_pid(self.xbuf.buff, &mut self.xbuf.index, val.as_mut_ptr())
+                };
+                if erl_code == ei_sys::ERL_ERROR {
+                    Err(ErlangTypeError::DecodeFails)
+                } else {
+                    Ok(ErlangPid(unsafe {val.assume_init()}))
+                }
+            } else {
+                Err(ErlangTypeError::TypeDiffers)
+            }
+        })
+    }
+
+    pub fn decode_ref(&mut self) -> Result<ErlangRef, ErlangTypeError> {
+        self.get_type().and_then(|et:ErlangType| {
+            if let ErlangType::Pid = et {
+                let mut val = MaybeUninit::<ei_sys::erlang_ref>::uninit();
+                let erl_code = unsafe {
+                    ei_sys::ei_decode_ref(self.xbuf.buff, &mut self.xbuf.index, val.as_mut_ptr())
+                };
+                if erl_code == ei_sys::ERL_ERROR {
+                    Err(ErlangTypeError::DecodeFails)
+                } else {
+                    Ok(ErlangRef(unsafe {val.assume_init()}))
+                }
+            } else {
+                Err(ErlangTypeError::TypeDiffers)
+            }
+        })
+    }
+
+    pub fn skip_term(&mut self) -> &mut XBuf {
+        unsafe {
+            ei_sys::ei_skip_term(self.xbuf.buff, &mut self.xbuf.index)
+        };
+        self
     }
 
 }
