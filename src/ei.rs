@@ -167,6 +167,7 @@ pub enum ErlangType {
     Tuple(Arity),
     String(Arity),
     List(Arity),
+    EmptyList,
     Binary(Arity),
     BitBinary(Arity),
     BigInt(Arity),
@@ -501,6 +502,7 @@ impl XBuf {
             ei_sys::ERL_SMALL_BIG_EXT | ei_sys::ERL_LARGE_BIG_EXT => ErlangType::BigInt(size),
             ei_sys::ERL_FUN_EXT | ei_sys::ERL_NEW_FUN_EXT => ErlangType::Function,
             ei_sys::ERL_MAP_EXT => ErlangType::Map(size),
+            ei_sys::ERL_NIL_EXT => ErlangType::EmptyList,
             otherwise => ErlangType::NotImplemented(otherwise as u32),
         };
         if get_type_ret == ei_sys::ERL_ERROR {
