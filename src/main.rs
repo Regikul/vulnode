@@ -30,7 +30,9 @@ fn main() {
     let mut shutdown = false;
 
     while !shutdown {
-        registry.retain(|child_name, (rx, tx)| {
+        let mut delete = Vec::new();
+        let mut add = Vec::new();
+        for (child_name, (rx, tx)) in registry.iter_mut() {
 
              match rx.try_recv() {
                  Ok(InterProcMessage::Shutdown) => {
@@ -38,7 +40,8 @@ fn main() {
                      shutdown = true;
                  },
                  Ok(InterProcMessage::NewConnection(conn)) => {
-                     println!("got connection request from {}", conn.remote_node)
+                     println!("got connection request from {}", conn.remote_node);
+                     add.push(conn);
                  },
                  Ok(InterProcMessage::Ping) => {
                      println!("someone want to know if we are alive! replying");
@@ -48,12 +51,24 @@ fn main() {
                  Err(TryRecvError::Empty) => (),
                  Err(TryRecvError::Disconnected) => {
                      println!("{} disconnected", child_name);
-                     return false
+                     delete.push(child_name.clone());
                  },
              };
+        }
+        for child_name in delete.iter() {
+            registry.remove_entry(child_name);
+        }
+        while add.len() > 0 {
+            let conn = add.pop().expect("Ooooops!");
+            let (local_sender, remote_recver) = channel::<InterProcMessage>();
+            let (remote_sender, local_recver) = channel::<InterProcMessage>();
 
-            true
-        });
+            registry.insert(conn.remote_node.clone(), (local_recver, local_sender));
+
+            let _ = thread::spawn(move || {
+                handle_connection(remote_recver, remote_sender, conn)
+            });
+        }
         thread::sleep(std::time::Duration::from_millis(1));
     };
 
@@ -103,6 +118,39 @@ fn connection_accepter(inbox: Receiver<InterProcMessage>, outbox: Sender<InterPr
     cnode.unpublish();
 }
 
+fn handle_connection(_inbox: Receiver<InterProcMessage>, _outbox: Sender<InterProcMessage>, connection: ei::ErlangConnection) -> () {
+    let mut run = 1;
+    while run == 1 {
+        let mut xbuf = ei::XBuf::new();
+        let recvd = xbuf.receive_msg(connection.socket, None);
+        if recvd.is_err() {
+            continue
+        }
+        let msg:ei::ErlangMsg = recvd.unwrap();
+        xbuf.reset_index();
+        xbuf.decode_version();
+        match msg.get_type(){
+            ei::ErlangMsgType::Send | ei::ErlangMsgType::RegSend => println!("got message of type {:?}", msg.get_type()),
+            _ => println!("got something unexpected"),
+        }
+        match xbuf.get_type().unwrap() {
+            ei::ErlangType::Atom(_) => {
+                let atom = xbuf.decode_atom().unwrap();
+                println!("got atom: {:?}", atom);
+                if atom == "quit" {
+                    run = 0;
+                }
+            },
+            ei::ErlangType::Binary(_) => {
+                let binary = xbuf.decode_binary().unwrap();
+                println!("got binary: {:?}", binary);
+            }
+            _else => println!("got unimplemented type! {:?}", _else)
+
+        };
+    }
+    ei::close_connection(connection.socket);
+}
 
 fn init_cnode(_ignore: ()) -> IOResult<ei::ErlangNode> {
     ei::NodeBuilder::new("secret", "cnode").connect_init()
