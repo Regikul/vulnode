@@ -1,11 +1,10 @@
 #![allow(dead_code)]
 
 extern crate ei_sys;
-
 use std::mem::MaybeUninit;
 use std::ffi::{CStr, CString, c_void};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::io::{Result as IOResult, Error};
+use std::io::{Result as IOResult, Error, ErrorKind};
 
 use in_addr;
 
@@ -15,8 +14,14 @@ pub type CNode = ei_sys::ei_cnode;
 
 pub struct ErlangNode {
     epmd_fd: Option<i32>,
+    listen_fd: Option<i32>,
     listen_port: Option<i32>,
     cnode: ei_sys::ei_cnode
+}
+
+pub struct ErlangConnection {
+    pub socket: i32,
+    pub remote_node: String
 }
 
 enum NodeBuilderType {
@@ -93,7 +98,8 @@ impl NodeBuilder {
             Ok(ErlangNode{
                 cnode: cnode,
                 epmd_fd: None,
-                listen_port: None
+                listen_port: None,
+                listen_fd: None,
             })
         }
     }
@@ -116,7 +122,7 @@ pub fn error_code() -> i32 {
 
 impl ErlangNode {
 
-    pub fn listen(self: &mut ErlangNode, port: Option<i32>, backlog: i32) -> IOResult<(FileDescr, SocketPort)> {
+    pub fn listen(&mut self, port: Option<i32>, backlog: i32) -> IOResult<FileDescr> {
         let mut actual_port = port.unwrap_or(0);
         let ret = unsafe {
             ei_sys::ei_listen(&mut self.cnode, &mut actual_port, backlog)
@@ -124,33 +130,54 @@ impl ErlangNode {
         if ret == ei_sys::ERL_ERROR {
             Err(Error::from_raw_os_error(error_code()))
         } else {
-            Ok((ret, actual_port))
-        }
-    }
-
-    pub fn accept(self: &mut ErlangNode, listensock: FileDescr) -> IOResult<(i32, ErlConnect)> {
-        let mut mem = MaybeUninit::<ErlConnect>::uninit();
-        let ret = unsafe {
-            ei_sys::ei_accept(&mut self.cnode, listensock, mem.as_mut_ptr())
-        };
-        if ret == ei_sys::ERL_ERROR {
-            Err(Error::from_raw_os_error(error_code()))
-        } else {
-            let conn: ErlConnect = unsafe {mem.assume_init()};
-            Ok((ret, conn))
-        }
-    }
-
-    pub fn publish(self: &mut ErlangNode, port: i32) -> IOResult<FileDescr> {
-        let ret = unsafe {
-            ei_sys::ei_publish(&mut self.cnode, port)
-        };
-        if ret == ei_sys::ERL_ERROR {
-            Err(Error::from_raw_os_error(error_code()))
-        } else {
-            self.epmd_fd = Some(ret);
+            self.listen_port = Some(actual_port);
+            self.listen_fd = Some(ret);
             Ok(ret)
         }
+    }
+
+    pub fn accept(&mut self, timeout: Option<u32>) -> IOResult<ErlangConnection> {
+        self.listen_fd.ok_or(Error::from(ErrorKind::InvalidData))
+            .and_then(|listensock|{
+                        let mut mem = MaybeUninit::<ErlConnect>::uninit();
+                        let ret = unsafe {
+                            ei_sys::ei_accept_tmo(&mut self.cnode, listensock, mem.as_mut_ptr(), timeout.unwrap_or(0))
+                        };
+                        if ret == ei_sys::ERL_ERROR {
+                            Err(Error::from_raw_os_error(error_code()))
+                        } else {
+                            let conn: ErlConnect = unsafe {mem.assume_init()};
+                            let nodename = cstr2ruststr(&conn.nodename);
+                            Ok(ErlangConnection{socket: ret, remote_node: nodename})
+                        }
+                    })
+    }
+
+    pub fn publish(&mut self, timeout: Option<u32>) -> IOResult<FileDescr> {
+        self.listen_port.or_else(||{
+            if self.listen(None, 10).is_ok() {
+                self.listen_port
+            } else {
+                None
+            }
+        }).ok_or(Error::from(ErrorKind::InvalidData))
+          .and_then(|port|{
+            let ret = unsafe {
+                ei_sys::ei_publish_tmo(&mut self.cnode, port, timeout.unwrap_or(0))
+            };
+            if ret == ei_sys::ERL_ERROR {
+                Err(Error::from_raw_os_error(error_code()))
+            } else {
+                self.epmd_fd = Some(ret);
+                Ok(ret)
+            }
+        })
+    }
+
+    pub fn unpublish(&mut self) {
+        self.epmd_fd.map(
+            |sock|close_connection(sock)
+        );
     }
 
 }
@@ -269,10 +296,10 @@ impl XBuf {
         unsafe {ei_sys::ei_x_free(&mut self.xbuf)};
     }
 
-    pub fn receive_msg(&mut self, fd: i32) -> IOResult<ErlangMsg> {
+    pub fn receive_msg(&mut self, fd: i32, timeout: Option<u32>) -> IOResult<ErlangMsg> {
         let mut msg_mem = MaybeUninit::<ei_sys::erlang_msg>::uninit();
         let erl_code = unsafe {
-            ei_sys::ei_xreceive_msg(fd, msg_mem.as_mut_ptr(), &mut self.xbuf)
+            ei_sys::ei_xreceive_msg_tmo(fd, msg_mem.as_mut_ptr(), &mut self.xbuf, timeout.unwrap_or(0))
         };
         if erl_code == ei_sys::ERL_ERROR {
             Err(Error::from_raw_os_error(error_code()))
@@ -805,3 +832,12 @@ impl Drop for XBuf {
     }
 }
 
+fn cstr2ruststr(input: &[i8]) -> String {
+    let cstr = unsafe {
+        std::ffi::CStr::from_ptr(input.as_ptr())
+    };
+    let cstring = std::ffi::CString::from(cstr);
+    cstring.to_str().and_then(
+        |s|Ok(String::from(s))
+    ).unwrap()
+}
