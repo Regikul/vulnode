@@ -1,7 +1,7 @@
 mod ei;
 
 use std::io::Result as IOResult;
-use std::sync::mpsc::{Sender, Receiver, TryRecvError, TrySendError, channel};
+use std::sync::mpsc::{Sender, Receiver, TryRecvError, channel};
 use std::collections::HashMap;
 use std::thread;
 
@@ -14,18 +14,28 @@ enum InterProcMessage {
 
 type Registry<M> = HashMap<String, (Receiver<M>, Sender<M>)>;
 
+fn spawn_worker<M, F, S>(registry:&mut Registry<M>, name: String, func: F, data: S) -> () 
+where
+    S: Send + 'static,
+    M: Send + 'static,
+    F: Send + FnOnce(Receiver<M>, Sender<M>, S) -> () + 'static,
+{
+    let (local_sender, remote_recver) = channel::<M>();
+    let (remote_sender, local_recver) = channel::<M>();
+
+    registry.insert(String::from(name), (local_recver, local_sender));
+
+    let _ = thread::spawn(move || {
+        func(remote_recver, remote_sender, data)
+    });
+}
+
 fn main() {
 
     let mut registry:Registry<InterProcMessage> = HashMap::new();
 
-    let (local_sender, remote_recver) = channel::<InterProcMessage>();
-    let (remote_sender, local_recver) = channel::<InterProcMessage>();
-
-    registry.insert(String::from("net_accepter"), (local_recver, local_sender));
-
-    let _ = thread::spawn(move || {
-        connection_accepter(remote_recver, remote_sender, ())
-    });
+    spawn_worker(&mut registry, String::from("net_accepter"), connection_accepter, ());
+    spawn_worker(&mut registry, String::from("vulkan_api"), vk_api, ());
 
     let mut shutdown = false;
 
@@ -60,14 +70,8 @@ fn main() {
         }
         while add.len() > 0 {
             let conn = add.pop().expect("Ooooops!");
-            let (local_sender, remote_recver) = channel::<InterProcMessage>();
-            let (remote_sender, local_recver) = channel::<InterProcMessage>();
 
-            registry.insert(conn.remote_node.clone(), (local_recver, local_sender));
-
-            let _ = thread::spawn(move || {
-                handle_connection(remote_recver, remote_sender, conn)
-            });
+            spawn_worker(&mut registry, conn.remote_node.clone(), handle_connection, conn)
         }
         thread::sleep(std::time::Duration::from_millis(1));
     };
@@ -90,6 +94,19 @@ fn worker_cleanup<T>(child_name: &String, (rx, _): &mut (Receiver<T>, Sender<T>)
             false
         },
         Ok(_) => true,
+    }
+}
+
+fn vk_api(inbox: Receiver<InterProcMessage>, outbox: Sender<InterProcMessage>, _state: ()) -> () {
+    loop {
+        match inbox.try_recv() {
+            Ok(InterProcMessage::Shutdown) => break,
+            Ok(InterProcMessage::Ping) => {
+                let _ = outbox.send(InterProcMessage::Pong);
+            },
+            Err(TryRecvError::Disconnected) => break,
+            _ => (),
+        }
     }
 }
 
