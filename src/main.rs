@@ -101,7 +101,7 @@ fn connection_accepter(inbox: Receiver<InterProcMessage>, outbox: Sender<InterPr
     println!("waiting for connection");
 
     loop {
-        if let Ok(connection) = cnode.accept(None) {
+        if let Ok(connection) = cnode.accept(Some(1)) {
             let _ = outbox.send(InterProcMessage::NewConnection(connection));
         }
 
@@ -118,11 +118,25 @@ fn connection_accepter(inbox: Receiver<InterProcMessage>, outbox: Sender<InterPr
     cnode.unpublish();
 }
 
-fn handle_connection(_inbox: Receiver<InterProcMessage>, _outbox: Sender<InterProcMessage>, connection: ei::ErlangConnection) -> () {
-    let mut run = 1;
-    while run == 1 {
+fn handle_connection(inbox: Receiver<InterProcMessage>, outbox: Sender<InterProcMessage>, connection: ei::ErlangConnection) -> () {
+    let mut shutdown = false;
+    while !shutdown {
+        match inbox.try_recv() {
+            Ok(InterProcMessage::Ping) => {
+                println!("someone want to know if we are alive!");
+                let _ = outbox.send(InterProcMessage::Pong);
+            },
+            Ok(InterProcMessage::Shutdown) => {
+                shutdown = true;
+            },
+            Err(TryRecvError::Empty) => (),
+            Err(TryRecvError::Disconnected) => {
+                shutdown = true;
+            }
+            _ => (),
+        }
         let mut xbuf = ei::XBuf::new();
-        let recvd = xbuf.receive_msg(connection.socket, None);
+        let recvd = xbuf.receive_msg(connection.socket, Some(1));
         if recvd.is_err() {
             continue
         }
@@ -137,9 +151,12 @@ fn handle_connection(_inbox: Receiver<InterProcMessage>, _outbox: Sender<InterPr
             ei::ErlangType::Atom(_) => {
                 let atom = xbuf.decode_atom().unwrap();
                 println!("got atom: {:?}", atom);
-                if atom == "quit" {
-                    run = 0;
-                }
+                if atom == "disconnect" {
+                    shutdown = true;
+                };
+                if atom == "shutdown" {
+                    let _ = outbox.send(InterProcMessage::Shutdown);
+                };
             },
             ei::ErlangType::Binary(_) => {
                 let binary = xbuf.decode_binary().unwrap();
