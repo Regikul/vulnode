@@ -5,6 +5,7 @@ use std::mem::MaybeUninit;
 use std::ffi::{CStr, CString, c_void};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::io::{Result as IOResult, Error, ErrorKind};
+use std::fmt;
 
 use in_addr;
 
@@ -19,9 +20,46 @@ pub struct ErlangNode {
     cnode: ei_sys::ei_cnode
 }
 
+#[derive(Debug)]
 pub struct ErlangConnection {
-    pub socket: i32,
-    pub remote_node: String
+    socket: i32,
+    remote_node: String
+}
+
+impl ErlangConnection {
+    pub fn socket(&self) -> i32 {
+        self.socket
+    }
+
+    pub fn remote_node(&self) -> &String {
+        &self.remote_node
+    }
+
+    pub fn receive_msg(&self, xbuf: &mut XBuf, timeout: Option<u32>) -> IOResult<ErlangMsg> {
+        let mut msg_mem = MaybeUninit::<ei_sys::erlang_msg>::uninit();
+        let erl_code = unsafe {
+            ei_sys::ei_xreceive_msg_tmo(self.socket, msg_mem.as_mut_ptr(), &mut xbuf.xbuf, timeout.unwrap_or(0))
+        };
+        if erl_code == ei_sys::ERL_ERROR {
+            Err(Error::from_raw_os_error(error_code()))
+        } else if erl_code == ei_sys::ERL_TICK {
+            Err(Error::from_raw_os_error(error_code()))
+        } else {
+            Ok(ErlangMsg(unsafe {msg_mem.assume_init()}))
+        }
+    }
+
+    pub fn send(&self, to: &mut ErlangPid, xbuf: &XBuf, tmo: Option<u32>) -> IOResult<()> {
+        let timeout = tmo.unwrap_or(0);
+        let erl_code = unsafe {
+            ei_sys::ei_send_tmo(self.socket, &mut to.0, xbuf.xbuf.buff, xbuf.xbuf.index, timeout)
+        };
+        if erl_code == ei_sys::ERL_ERROR {
+            Err(Error::from_raw_os_error(error_code()))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 enum NodeBuilderType {
@@ -182,6 +220,22 @@ impl ErlangNode {
 
 }
 
+#[derive(Debug, Clone)]
+pub enum ErlangTerm {
+    Integer(i64),
+    Unsigned(u64),
+    Float(f64),
+    Atom(String),
+    Reference{node: String, creation: u32, n: Vec<u32>},
+    Port{node: String, creation: u32, id: u32},
+    Pid{node: String, creation: u32, num: u32, serial: u32},
+    Tuple(Vec<ErlangTerm>),
+    String(Vec<u8>),
+    List(Vec<ErlangTerm>),
+    Binary(Vec<u8>),
+    Map(Vec<(ErlangTerm, ErlangTerm)>),
+}
+
 type Arity = i32;
 #[derive(Debug)]
 pub enum ErlangType {
@@ -203,10 +257,33 @@ pub enum ErlangType {
     NotImplemented(u32),
 }
 
+impl fmt::Display for ErlangType {
+    fn fmt (&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ErlangType::Integer => write!(f, "#Integer#"),
+            ErlangType::Float => write!(f, "#Float#"),
+            ErlangType::Atom(_) => write!(f, "#Atom#"),
+            ErlangType::Reference => write!(f, "#Ref#"),
+            ErlangType::Port => write!(f, "#Port#"),
+            ErlangType::Pid => write!(f, "#Pid#"),
+            ErlangType::Tuple(arity) => write!(f, "#Tuple({})#", arity),
+            ErlangType::String(_arity) => write!(f, "#String#"),
+            ErlangType::List(arity) => write!(f, "#List({})#", arity),
+            ErlangType::EmptyList => write!(f, "#Nil#"),
+            ErlangType::Binary(_arity) => write!(f, "#Binary#"),
+            ErlangType::BitBinary(_arity) => write!(f, "#BitBinary#"),
+            ErlangType::BigInt(_arity) => write!(f, "#BigInt#"),
+            ErlangType::Function => write!(f, "#Function#"),
+            ErlangType::Map(_arity) => write!(f, "#Map#"),
+            ErlangType::NotImplemented(code) => write!(f, "Unknown({})", code),
+        }
+    }   
+}
+
 #[derive(Debug)]
 pub enum ErlangTypeError {
     CanNotGetType,
-    TypeDiffers,
+    TypeDiffers{got: ErlangType},
     DecodeFails,
 }
 
@@ -231,6 +308,18 @@ pub struct ErlangPid(ei_sys::erlang_pid);
 pub struct ErlangPort(ei_sys::erlang_port);
 pub struct ErlangTraceToken(ei_sys::erlang_trace);
 pub struct ErlangMsg(ei_sys::erlang_msg);
+
+impl fmt::Display for ErlangRef {
+    fn fmt (&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "#Ref<{}.{}.{}.{}>", self.0.creation, self.0.n[2], self.0.n[1], self.0.n[0])
+    }
+}
+
+impl fmt::Display for ErlangPid {
+    fn fmt (&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{}.{}.{}>", self.0.creation, self.0.num, self.0.serial)
+    }
+}
 
 impl ErlangMsg {
     pub fn get_type(&self) -> ErlangMsgType {
@@ -294,20 +383,6 @@ impl XBuf {
 
     pub fn free(&mut self) {
         unsafe {ei_sys::ei_x_free(&mut self.xbuf)};
-    }
-
-    pub fn receive_msg(&mut self, fd: i32, timeout: Option<u32>) -> IOResult<ErlangMsg> {
-        let mut msg_mem = MaybeUninit::<ei_sys::erlang_msg>::uninit();
-        let erl_code = unsafe {
-            ei_sys::ei_xreceive_msg_tmo(fd, msg_mem.as_mut_ptr(), &mut self.xbuf, timeout.unwrap_or(0))
-        };
-        if erl_code == ei_sys::ERL_ERROR {
-            Err(Error::from_raw_os_error(error_code()))
-        } else if erl_code == ei_sys::ERL_TICK {
-            Err(Error::from_raw_os_error(error_code()))
-        } else {
-            Ok(ErlangMsg(unsafe {msg_mem.assume_init()}))
-        }
     }
 
     pub fn append(&mut self, other: &mut XBuf) -> &mut XBuf {
@@ -418,7 +493,7 @@ impl XBuf {
         self
     }
 
-    pub fn encode_list_longlong(&mut self, n: i64) -> &mut XBuf {
+    pub fn encode_longlong(&mut self, n: i64) -> &mut XBuf {
         unsafe {
             ei_sys::ei_x_encode_longlong(&mut self.xbuf, n)
         };
@@ -439,9 +514,9 @@ impl XBuf {
         self
     }
 
-    pub fn encode_port(&mut self, port: &ei_sys::erlang_port) -> &mut XBuf {
+    pub fn encode_port(&mut self, port: &ErlangPort) -> &mut XBuf {
         unsafe {
-            ei_sys::ei_x_encode_port(&mut self.xbuf, port)
+            ei_sys::ei_x_encode_port(&mut self.xbuf, &port.0)
         };
         self
     }
@@ -461,9 +536,9 @@ impl XBuf {
         self
     }
 
-    pub fn encode_string_len(&mut self, string: &str, len: i32) -> &mut XBuf {
+    pub fn encode_string_bytes(&mut self, string: &[u8]) -> &mut XBuf {
         unsafe {
-            ei_sys::ei_x_encode_string_len(&mut self.xbuf, string.as_ptr() as *const i8, len)
+            ei_sys::ei_x_encode_string_len(&mut self.xbuf, string.as_ptr() as *const i8, string.len() as i32)
         };
         self
     }
@@ -568,7 +643,7 @@ impl XBuf {
                             .map(|v|String::from(v))
                     }
                 } else {
-                    Err(ErlangTypeError::TypeDiffers)
+                    Err(ErlangTypeError::TypeDiffers{got: ty})
                 }
             })
     }
@@ -589,7 +664,7 @@ impl XBuf {
                     Ok(bin)
                 }
             } else {
-                Err(ErlangTypeError::TypeDiffers)
+                Err(ErlangTypeError::TypeDiffers{got: ty})
             }
         })
     }
@@ -602,7 +677,7 @@ impl XBuf {
             })
     }
 
-    pub fn decode_string(&mut self) -> Result<String, ErlangTypeError> {
+    pub fn decode_string(&mut self) -> Result<Vec<u8>, ErlangTypeError> {
         self.get_type().and_then(|ty:ErlangType| {
             if let ErlangType::String(arity) = ty {
                 let bin_size = arity as usize + 1;
@@ -614,10 +689,11 @@ impl XBuf {
                 if erl_code == ei_sys::ERL_ERROR {
                     Err(ErlangTypeError::DecodeFails)
                 } else {
-                    String::from_utf8(bin).map_err(|_| ErlangTypeError::DecodeFails)
+                    bin.truncate(bin.len() - 1);
+                    Ok(bin)
                 }
             } else {
-                Err(ErlangTypeError::TypeDiffers)
+                Err(ErlangTypeError::TypeDiffers{got: ty})
             }
         })
     }
@@ -635,7 +711,7 @@ impl XBuf {
                     Ok(bval != 0)
                 }
             } else {
-                Err(ErlangTypeError::TypeDiffers)
+                Err(ErlangTypeError::TypeDiffers{got: et})
             }
         })
     }
@@ -653,7 +729,7 @@ impl XBuf {
                     Ok(val as u8)
                 }
             } else {
-                Err(ErlangTypeError::TypeDiffers)
+                Err(ErlangTypeError::TypeDiffers{got: et})
             }
         })
     }
@@ -671,7 +747,7 @@ impl XBuf {
                     Ok(val)
                 }
             } else {
-                Err(ErlangTypeError::TypeDiffers)
+                Err(ErlangTypeError::TypeDiffers{got: et})
             }
         })
     }
@@ -689,7 +765,7 @@ impl XBuf {
                     Ok(val)
                 }
             } else {
-                Err(ErlangTypeError::TypeDiffers)
+                Err(ErlangTypeError::TypeDiffers{got: et})
             }
         })
     }
@@ -707,7 +783,7 @@ impl XBuf {
                     Ok(val)
                 }
             } else {
-                Err(ErlangTypeError::TypeDiffers)
+                Err(ErlangTypeError::TypeDiffers{got: et})
             }
         })
     }
@@ -725,7 +801,7 @@ impl XBuf {
                     Ok(val)
                 }
             } else {
-                Err(ErlangTypeError::TypeDiffers)
+                Err(ErlangTypeError::TypeDiffers{got: et})
             }
         })
     }
@@ -743,7 +819,7 @@ impl XBuf {
                     Ok(val)
                 }
             } else {
-                Err(ErlangTypeError::TypeDiffers)
+                Err(ErlangTypeError::TypeDiffers{got: et})
             }
         })
     }
@@ -761,7 +837,7 @@ impl XBuf {
                     Ok(val)
                 }
             } else {
-                Err(ErlangTypeError::TypeDiffers)
+                Err(ErlangTypeError::TypeDiffers{got: et})
             }
         })
     }
@@ -779,14 +855,14 @@ impl XBuf {
                     Ok(ErlangPid(unsafe {val.assume_init()}))
                 }
             } else {
-                Err(ErlangTypeError::TypeDiffers)
+                Err(ErlangTypeError::TypeDiffers{got: et})
             }
         })
     }
 
     pub fn decode_ref(&mut self) -> Result<ErlangRef, ErlangTypeError> {
         self.get_type().and_then(|et:ErlangType| {
-            if let ErlangType::Pid = et {
+            if let ErlangType::Reference = et {
                 let mut val = MaybeUninit::<ei_sys::erlang_ref>::uninit();
                 let erl_code = unsafe {
                     ei_sys::ei_decode_ref(self.xbuf.buff, &mut self.xbuf.index, val.as_mut_ptr())
@@ -797,9 +873,182 @@ impl XBuf {
                     Ok(ErlangRef(unsafe {val.assume_init()}))
                 }
             } else {
-                Err(ErlangTypeError::TypeDiffers)
+                Err(ErlangTypeError::TypeDiffers{got: et})
             }
         })
+    }
+
+    pub fn decode_port(&mut self) -> Result<ErlangPort, ErlangTypeError> {
+        self.get_type().and_then(|et:ErlangType| {
+            if let ErlangType::Port = et {
+                let mut val = MaybeUninit::<ei_sys::erlang_port>::uninit();
+                let erl_code = unsafe {
+                    ei_sys::ei_decode_port(self.xbuf.buff, &mut self.xbuf.index, val.as_mut_ptr())
+                };
+                if erl_code == ei_sys::ERL_ERROR {
+                    Err(ErlangTypeError::DecodeFails)
+                } else {
+                    Ok(ErlangPort(unsafe {val.assume_init()}))
+                }
+            } else {
+                Err(ErlangTypeError::TypeDiffers{got: et})
+            }
+        })
+    }
+
+    pub fn decode_term(&mut self) -> Result<ErlangTerm, ErlangTypeError> {
+        self.get_type().and_then(|typ:ErlangType|{
+            match typ {
+                ErlangType::Atom(_) => Ok(ErlangTerm::Atom(self.decode_atom().unwrap())),
+                ErlangType::Binary(_) => Ok(ErlangTerm::Binary(self.decode_binary().unwrap())),
+                ErlangType::EmptyList => {
+                    self.skip_term();
+                    Ok(ErlangTerm::List(Vec::new()))
+                },
+                ErlangType::Float => Ok(ErlangTerm::Float(self.decode_double().unwrap())),
+                ErlangType::Integer => Ok(ErlangTerm::Integer(self.decode_long().unwrap())),
+                ErlangType::String(_) => Ok(ErlangTerm::String(self.decode_string().unwrap())),
+                ErlangType::List(arity) => {
+                    let _ = self.decode_list_header().unwrap();
+                    let mut content = Vec::new();
+                    for _ in 0..arity {
+                        let term = self.decode_term().unwrap();
+                        content.push(term);
+                    }
+                    let _ = self.skip_term();
+                    Ok(ErlangTerm::List(content))
+                },
+                ErlangType::Tuple(arity) => {
+                    let _ = self.decode_tuple_header().unwrap();
+                    let mut content = Vec::new();
+                    for _ in 0..arity {
+                        let term = self.decode_term().unwrap();
+                        content.push(term);
+                    }
+                    Ok(ErlangTerm::Tuple(content))
+                },
+                ErlangType::Map(arity) => {
+                    let _ = self.decode_map_header().unwrap();
+                    let mut content = Vec::new();
+                    for _ in 0..arity {
+                        let key = self.decode_term().unwrap();
+                        let value = self.decode_term().unwrap();
+                        content.push((key, value));
+                    }
+                    Ok(ErlangTerm::Map(content))
+                },
+                ErlangType::Pid => {
+                    let epid = self.decode_pid().unwrap();
+                    Ok(ErlangTerm::Pid{
+                        node: cstr2ruststr(&epid.0.node),
+                        serial: epid.0.serial,
+                        num: epid.0.num,
+                        creation: epid.0.creation
+                    })
+                },
+                ErlangType::Port => {
+                    let eport = self.decode_port().unwrap();
+                    Ok(ErlangTerm::Port{
+                        node: cstr2ruststr(&eport.0.node),
+                        id: eport.0.id,
+                        creation: eport.0.creation
+                    })
+                },
+                ErlangType::Reference => {
+                    let eref = self.decode_ref().unwrap();
+                    Ok(ErlangTerm::Reference{
+                        node: cstr2ruststr(&eref.0.node),
+                        creation: eref.0.creation,
+                        n: Vec::from(&eref.0.n[0..(eref.0.len as usize)]),
+                    })
+                },
+                ErlangType::BitBinary(_) |
+                ErlangType::BigInt(_) |
+                ErlangType::Function |
+                ErlangType::NotImplemented(_) => Err(ErlangTypeError::DecodeFails),
+            }
+        })
+    }
+
+    pub fn encode_term(&mut self, term: &ErlangTerm) -> &mut XBuf {
+        match term {
+            ErlangTerm::Atom(name) => self.encode_atom(name),
+            ErlangTerm::Binary(content) => self.encode_binary(content),
+            ErlangTerm::Float(float) => self.encode_double(*float),
+            ErlangTerm::Integer(int) => self.encode_long(*int),
+            ErlangTerm::Unsigned(uint) => self.encode_ulong(*uint),
+            ErlangTerm::String(content) => self.encode_string_bytes(content),
+            ErlangTerm::List(content) => {
+                let header = content.len() as i64;
+                println!("got header {}", header);
+                self.encode_list_header(header);
+                for term in content {
+                    println!("encoding term {:?}", term);
+                    self.encode_term(term);
+                };
+                 if header > 0 {
+                     self.encode_empty_list()
+                 } else {
+                     self
+                 }
+            },
+            ErlangTerm::Map(content) => {
+                let header = content.len() as i64;
+                self.encode_map_header(header);
+                for (key, value) in content {
+                    self.encode_term(key);
+                    self.encode_term(value);
+                };
+                self
+            },
+            ErlangTerm::Tuple(content) => {
+                let header = content.len() as i64;
+                self.encode_tuple_header(header);
+                for term in content {
+                    println!("encoding term {:?}", term);
+                    self.encode_term(term);
+                };
+                self
+            },
+            ErlangTerm::Pid{node, creation, num, serial} => {
+                let mut epid = ei_sys::erlang_pid {
+                    node: [0; ei_sys::MAXATOMLEN_UTF8],
+                    serial: *serial,
+                    creation: *creation,
+                    num: *num,
+                };
+                for (i, c) in node.bytes().enumerate() {
+                    epid.node[i] = c as i8;
+                };
+                self.encode_pid(&ErlangPid(epid))
+            },
+            ErlangTerm::Reference{node, creation, n} => {
+                let mut eref = ei_sys::erlang_ref{
+                    node: [0; ei_sys::MAXATOMLEN_UTF8],
+                    creation: *creation,
+                    len: n.len() as i32,
+                    n: [0; 3],
+                };
+                for (i, c) in node.bytes().enumerate() {
+                    eref.node[i] = c as i8;
+                };
+                for (i, v) in n.iter().enumerate() {
+                    eref.n[i] = *v;
+                };
+                self.encode_ref(&ErlangRef(eref))
+            },
+            ErlangTerm::Port{node, creation, id} => {
+                let mut eport = ei_sys::erlang_port{
+                    node: [0; ei_sys::MAXATOMLEN_UTF8],
+                    id: *id,
+                    creation: *creation,
+                };
+                for (i, c) in node.bytes().enumerate() {
+                    eport.node[i] = c as i8;
+                };
+                self.encode_port(&ErlangPort(eport))
+            },
+        }
     }
 
     pub fn skip_term(&mut self) -> &mut XBuf {
