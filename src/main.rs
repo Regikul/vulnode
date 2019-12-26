@@ -1,9 +1,11 @@
 mod ei;
+mod vulkan;
 
 use std::io::Result as IOResult;
 use std::sync::mpsc::{Sender, Receiver, TryRecvError, channel};
 use std::collections::HashMap;
 use std::thread;
+use ei::ErlangTerm;
 
 #[derive(Debug)]
 enum InterProcMessage {
@@ -16,7 +18,7 @@ enum InterProcMessage {
 
 #[derive(Debug)]
 enum Command {
-    Fractal,
+    Fractal{w:u32, h:u32},
     Echo(ei::ErlangTerm),
     Disconnect,
     Shutdown,
@@ -179,8 +181,13 @@ fn handle_connection(inbox: Receiver<InterProcMessage>, outbox: Sender<InterProc
                 println!("going to shutdown");
                 let _ = outbox.send(InterProcMessage::Shutdown);
             },
-            Command::Fractal => {
-                println!("fractal image requested");
+            Command::Fractal{w, h} => {
+                let image = vulkan::make_fractal_image(w, h);
+                xbuf.reset_index()
+                    .encode_version()
+                    .encode_binary(image.as_slice());
+                let _ = connection.send(&mut msg.from(), &xbuf, None);
+                println!("fractal image sent");
             },
             Command::Unrecognized => {
                 println!("unrecognized command");
@@ -191,75 +198,18 @@ fn handle_connection(inbox: Receiver<InterProcMessage>, outbox: Sender<InterProc
     ei::close_connection(connection.socket());
 }
 
-fn term_to_string(xbuf: &mut ei::XBuf) -> String {
-    use ei::ErlangType;
-    match xbuf.get_type().unwrap() {
-        ErlangType::Atom(_) => {
-            xbuf.decode_atom().unwrap()
-        },
-        ErlangType::Binary(_) => {
-            xbuf.skip_term();
-            String::from("<<...>>")
-        },
-        ErlangType::Tuple(_arity) => {
-            let mut s = String::new();
-            if _arity == 0 {
-                String::from("{}");
-            } else if _arity > 0 {
-                s.push_str("{");
-                let _ = xbuf.decode_tuple_header();
-                s.push_str(term_to_string(xbuf).as_str());
-                for _ in 1.._arity {
-                    s.push_str(",");
-                    s.push_str(term_to_string(xbuf).as_str());
-                }
-                s.push_str("}")
-            }
-            s
-        },
-        ErlangType::Integer => {
-            let int = xbuf.decode_long().unwrap();
-            int.to_string()
-        },
-        ErlangType::Float => {
-            let float = xbuf.decode_double().unwrap();
-            float.to_string()
-        },
-        ErlangType::Pid => {
-            let pid = xbuf.decode_pid().unwrap();
-            pid.to_string()
-        },
-        ErlangType::Reference => {
-            let eref = xbuf.decode_ref().unwrap();
-            eref.to_string()
-        },
-        ErlangType::EmptyList => {
-            xbuf.skip_term();
-            String::from("[]")
-        },
-        ErlangType::List(_arity) => {
-            let mut s = String::new();
-            if _arity > 0 {
-                s.push_str("[");
-                let _ = xbuf.decode_list_header();
-                s.push_str(term_to_string(xbuf).as_str());
-                for _ in 1.._arity {
-                    s.push_str(",");
-                    s.push_str(term_to_string(xbuf).as_str());
-                }
-                s.push_str("]")
-            }
-            s
-        },
-        _erl_type => String::from(format!("{}", _erl_type))
+fn get_fractal_size(term: &ErlangTerm) -> Option<(u32, u32)> {
+    if let ErlangTerm::Tuple(vec) = term {
+        match (vec[0].clone(), vec[1].clone()) {
+            (ErlangTerm::Integer(w), ErlangTerm::Integer(h)) => Some((w as u32, h as u32)),
+            _ => None
+        }
+    } else {
+        None
     }
 }
 
 fn recognize_command(xbuf: &mut ei::XBuf) -> Command {
-    use ei::ErlangTerm;
-    xbuf.reset_index();
-    xbuf.decode_version();
-    println!("trying to decode {}", term_to_string(xbuf));
     xbuf.reset_index();
     xbuf.decode_version();
     match xbuf.decode_term().unwrap() {
@@ -267,6 +217,11 @@ fn recognize_command(xbuf: &mut ei::XBuf) -> Command {
             if let [ErlangTerm::Atom(command), term] = values.as_slice() {
                 match command.as_ref() {
                     "echo" => Command::Echo(term.clone()),
+                    "fractal" => {
+                        get_fractal_size(term).and_then(|(w, h)|{
+                            Some(Command::Fractal{w, h})
+                        }).unwrap_or(Command::Unrecognized)
+                    }
                     _ => Command::Unrecognized,
                 }
             } else {
@@ -280,7 +235,6 @@ fn recognize_command(xbuf: &mut ei::XBuf) -> Command {
             match atom.as_ref() {
                 "disconnect" => Command::Disconnect,
                 "shutdown" => Command::Shutdown,
-                "fractal" => Command::Fractal,
                 _ => Command::Unrecognized,
             }
         }
