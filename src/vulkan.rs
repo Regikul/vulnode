@@ -5,14 +5,13 @@ use vulkano::device;
 use vulkano::buffer;
 use vulkano::command_buffer;
 use vulkano::command_buffer::CommandBuffer;
-use vulkano::descriptor;
 use vulkano::pipeline;
 use vulkano::descriptor::descriptor_set;
 use vulkano::sync::GpuFuture;
 use vulkano::format::Format;
 use vulkano::image::Dimensions;
 use vulkano::image::StorageImage;
-use vulkano::format::ClearValue;
+use png;
 
 mod cs {
     vulkano_shaders::shader!{
@@ -59,10 +58,6 @@ pub fn make_fractal_image(width: u32, height: u32) -> Vec<u8> {
     
     let physical = vulkan::PhysicalDevice::enumerate(&instance).next().expect("can not find device onboard!");
 
-    for family in physical.queue_families() {
-        println!("found a queue family with {:?} queue(s)", family.queues_count());
-    }
-
     let queue_family = physical.queue_families()
                                .find(|&q| q.supports_compute())
                                .expect("couldn't find a compute queue family");
@@ -107,6 +102,16 @@ pub fn make_fractal_image(width: u32, height: u32) -> Vec<u8> {
     finished.then_signal_fence_and_flush().unwrap()
         .wait(None).unwrap();
 
-    let read_lock = buf.read().unwrap();
-    Vec::from(&read_lock[..])
+    let buffer_content = buf.read().unwrap();
+    let mut image_data = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut image_data, width, height);
+        encoder.set_color(png::ColorType::RGBA);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+
+        writer.write_image_data(&buffer_content[..]).unwrap();
+    }
+
+    image_data
 }
